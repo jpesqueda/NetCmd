@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NetCmd v1.2.1: multivendor SSH command runner with interactive workflows.
+"""NetCmd v1.2.2: multivendor SSH command runner with interactive workflows.
 
 Designed for Windows / Python 3.10+. No third-party package is imported when
 showing --help, --version or validating an input file with --dry-run.
@@ -20,9 +20,14 @@ import threading
 import time
 from typing import Any
 
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 DEFAULT_TIMEOUT = 60.0
-PROMPT_PATTERN = re.compile(r"(?m)^\s*[^\r\n]{1,160}[#>$]\s*$")
+# Cisco IOS-XE, NX-OS and EOS prompts, including all CLI submodes.
+# Anchoring to a single final line avoids treating earlier output as the next prompt.
+PROMPT_PATTERN = re.compile(r"[A-Za-z0-9_.:/@~-]+(?:\([^\r\n()]{1,80}\))*[>#%$]", re.ASCII)
+CONFIG_MODES = re.compile(r"\((?:config|conf)(?:[-/][^()]*)?\)", re.I)
+CONFIG_ENTER = re.compile(r"^(?:conf(?:igure)?(?:\s+(?:terminal|t))?|config\s+t)$", re.I)
+CONFIG_LEAVE = re.compile(r"^(?:end|disable)$", re.I)
 ERROR_PATTERN = re.compile(
     r"(?im)^\s*(?:%\s*(?:invalid|error|incomplete|ambiguous|unknown|unrecognized|failed)|"
     r"error:\s|syntax error|invalid command|unknown command|command not found|"
@@ -387,11 +392,52 @@ def classify_connection_error(exc: BaseException) -> tuple[str, str]:
     return "SSH CONNECTION FAILED", detail
 
 
-def session_transcript(prompt: str, command: str, response: str) -> str:
-    """One CLI-looking block: real prompt+command followed by captured output.
+def extract_cli_prompt(text: str) -> str | None:
+    """Return the *final* standalone prompt, never an intermediate output line."""
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n").split("\n")
+    if not lines:
+        return None
+    candidate = lines[-1].strip()
+    return candidate if PROMPT_PATTERN.fullmatch(candidate) else None
 
-    Strip only an exact leading echoed command and final naked prompt. Do not
-    throw away arbitrary CLI error text, or duplicate a command echo.
+
+def cli_mode(prompt: str) -> str:
+    """A Cisco-like mode hint. No vendor configuration commands are injected."""
+    return "config" if CONFIG_MODES.search(prompt) else "exec"
+
+
+@dataclass
+class CliModeTracker:
+    """Observe real prompts after every command and validate common transitions.
+
+    The device is authoritative: NetCmd never guesses or sends an extra end command.
+    Unknown vendor prompts are permitted as long as a complete prompt is read.
+    """
+    current_prompt: str
+    device_type: str
+
+    def observe(self, command: str, response: str) -> str:
+        next_prompt = extract_cli_prompt(response)
+        if not next_prompt:
+            raise CommandFailure("No complete CLI prompt after command; command outcome unknown")
+        previous_mode = cli_mode(self.current_prompt)
+        next_mode = cli_mode(next_prompt)
+        cmd = command.strip().lower()
+        # Validate mode transitions for the Cisco/Arista CLI family only.
+        # Other vendors keep prompt synchronization without Cisco semantics.
+        supported = self.device_type.startswith(("cisco_", "arista_"))
+        if supported and CONFIG_ENTER.fullmatch(cmd) and next_mode != "config":
+            raise CommandFailure(f"Configuration mode not entered (prompt: {next_prompt})")
+        if supported and CONFIG_LEAVE.fullmatch(cmd) and previous_mode == "config" and next_mode == "config":
+            raise CommandFailure(f"Configuration mode not exited (prompt: {next_prompt})")
+        self.current_prompt = next_prompt
+        return next_prompt
+
+
+def session_transcript(prompt: str, command: str, response: str) -> str:
+    """Use the prompt captured before the command; omit the resulting prompt.
+
+    Never add an extra prompt line when the device switches to a new submode.
     """
     cleaned = response.replace("\r\n", "\n").replace("\r", "\n")
     lines = cleaned.split("\n")
@@ -400,11 +446,12 @@ def session_transcript(prompt: str, command: str, response: str) -> str:
     command_text = command.strip()
     if lines:
         first = lines[0].strip()
-        if first == command_text or (prompt and first == prompt.strip() + command_text) or (prompt and first == prompt.strip() + " " + command_text):
+        if first == command_text or (prompt and first in (prompt.strip() + command_text, prompt.strip() + " " + command_text)):
             lines.pop(0)
     while lines and not lines[-1].strip():
         lines.pop()
-    if lines and prompt and lines[-1].strip() == prompt.strip():
+    # The final prompt may differ from the prompt before the command!
+    if lines and extract_cli_prompt(lines[-1]):
         lines.pop()
     remainder = "\n".join(lines).strip("\n")
     title = f"{prompt.strip() if prompt else ''}{command_text}"
@@ -412,19 +459,22 @@ def session_transcript(prompt: str, command: str, response: str) -> str:
 
 
 def channel_read_until(connection: Any, pattern: str, timeout: float, *, quiet_prompt: bool = False) -> str:
-    """Read raw SSH channel to a regex match; never send an unrequested answer."""
-    compiled = re.compile(pattern, re.I | re.M)
+    """Wait until the last line is a CLI prompt (or a specific interactive regex)."""
+    compiled = None if quiet_prompt else re.compile(pattern, re.I | re.M)
     collected = ""
     until = time.monotonic() + timeout
     while time.monotonic() < until:
         chunk = connection.read_channel()
         if chunk:
             collected += chunk
-            if compiled.search(collected):
+            if quiet_prompt:
+                if extract_cli_prompt(collected):
+                    return collected
+            elif compiled and compiled.search(collected):
                 return collected
         else:
             time.sleep(0.15)
-    kind = "device prompt" if quiet_prompt else f"expected pattern {pattern!r}"
+    kind = "complete CLI prompt" if quiet_prompt else f"expected pattern {pattern!r}"
     raise CommandFailure(f"Timeout after {timeout:g}s waiting for {kind}; last output: {collected[-250:]!r}")
 
 
@@ -514,6 +564,7 @@ def device_worker(job: DeviceJob, args: Any, logger: logging.Logger, outpath: Pa
             return result
         if args.mode == "config":
             connection.config_mode()
+        tracker = CliModeTracker(connection.find_prompt().strip(), dtype)
         for step in job.steps:
             if isinstance(step, WaitStep):
                 logger.info("%s | Wait %.1fs", job.host, step.seconds)
@@ -523,12 +574,18 @@ def device_worker(job: DeviceJob, args: Any, logger: logging.Logger, outpath: Pa
             logger.info("%s | Executing line=%d | %s", job.host, step.line, redact_command(step.command))
             start = time.perf_counter()
             try:
+                # Refresh from the live device; keeps state consistent with the channel.
                 prompt = connection.find_prompt().strip()
+                tracker.current_prompt = prompt
                 response, connection = run_command(connection, step, timeout, job.host, dtype, username, password, args)
                 output_chunks.append(session_transcript(prompt, step.command, response).rstrip("\n") + "\n\n")
                 reason = classify_command(step.command, response)
                 if reason:
                     raise CommandFailure(reason)
+                if step.wait_disconnect is not None:
+                    tracker.current_prompt = connection.find_prompt().strip()
+                else:
+                    tracker.observe(step.command, response)
                 result.passed += 1
                 logger.info("%s | PASS | %s | %.2fs", job.host, redact_command(step.command), time.perf_counter()-start)
             except Exception as exc:
