@@ -1,34 +1,16 @@
 # Publishing NetCmd to PyPI
 
-NetCmd is packaged with `pyproject.toml` and a console entry point `netcmd`.
-Release publishing uses GitHub Actions **Trusted Publishing (OIDC)**. No PyPI
-API token should be committed to this repository.
+This version is **1.2.1**. Publication requires the GitHub repository to have the updated `netcmd.py` and `pyproject.toml` on the selected commit.
 
-## First-time PyPI setup (one-time, account owner action)
+The `.github/workflows/publish.yml` workflow uses PyPI trusted publishing with:
+- GitHub owner `jpesqueda`
+- repository `NetCmd`
+- workflow `publish.yml`
+- GitHub environment `pypi`
 
-1. Sign in to https://pypi.org/ and visit
-   https://pypi.org/manage/account/publishing/.
-2. Under **Add a new pending publisher**, choose **GitHub**.
-3. Use these exact values:
+After reviewing the changes and tests, push them to `main`, then run the workflow through GitHub Actions (or publish a GitHub Release). No PyPI tokens should be committed. Increment the version for each new PyPI upload: PyPI does not permit overwriting an already uploaded distribution.
 
-   | Field | Value |
-   |---|---|
-   | PyPI project name | `netcmd` |
-   | GitHub owner | `jpesqueda` |
-   | Repository name | `NetCmd` |
-   | Workflow filename | `publish.yml` |
-   | Environment name | `pypi` |
-
-4. Select **Add**. The package name must actually be available on PyPI;
-   do not assume that a missing search result reserves it.
-5. In GitHub, open **Settings → Environments** and create/configure
-   `pypi`. Restrict publication to trusted maintainers and configure
-   required reviewers where appropriate.
-
-The publisher is only pending until the first successful upload. Do not
-configure PyPI credentials in GitHub Secrets: this workflow uses GitHub OIDC.
-
-## Test and build
+Before publication:
 
 ```powershell
 py -m unittest discover -s tests -v
@@ -37,26 +19,4 @@ py -m build
 py -m twine check dist/*
 ```
 
-## Publish the first release
-
-After registration, open GitHub **Actions → Publish NetCmd to PyPI → Run workflow**
-and select `main`. The workflow runs tests, builds sdist and wheel, then
-uploads them using `pypa/gh-action-pypi-publish`. The `pypi` environment
-can require explicit approval. GitHub Releases published later will also
-trigger this workflow automatically.
-
-`1.2.0` cannot be uploaded again to PyPI if it was already published.
-Increment the package version in `pyproject.toml` **and**
-`netcmd.py` before the next upload.
-
-## Install after a successful publication
-
-```powershell
-py -m pip install netcmd
-netcmd --version
-netcmd --help
-```
-
-Do not execute network automation against production devices before lab
-validation of each platform-specific workflow, especially upgrades and
-reconnect sequences.
+The workflow uses an OIDC token tied to the trusted publisher. For production use, configure GitHub environment protection rules and manually approve publishing.
