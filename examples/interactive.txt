@@ -1,0 +1,18 @@
+# Illustrative only. Validate CLI/prompts and platform support in a lab.
+# Run with -dt cisco_nxos or use Multifile DeviceType:cisco_nxos.
+show version
+@timeout 60
+copy running-config startup-config
+@expect Destination filename
+@send [Enter]
+@timeout 60
+copy running-config bootflash:Config_2026_11_11
+@expect Destination filename
+@send [Enter]
+# Configure install commands only after prechecks and compatibility validation.
+# @timeout 240
+# install all nxos bootflash:nxos64.10.5.6.M.bin
+# @expect Do you want to continue with the installation
+# @send y
+# @wait-disconnect 300
+# @reconnect 900
