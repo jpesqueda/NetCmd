@@ -1,0 +1,15 @@
+config t
+tacacs server TACACS-NEW-01
+address ipv4 192.0.2.10
+key 0 REEMPLAZAR_CLAVE
+exit
+tacacs server TACACS-NEW-02
+address ipv4 192.0.2.11
+key 0 REEMPLAZAR_CLAVE
+exit
+aaa group server tacacs+ TACACS_NEW
+server name TACACS-NEW-01
+server name TACACS-NEW-02
+exit
+end
+wr
