@@ -1,33 +1,13 @@
-# PROJECT_CONTEXT — NetCmd
+# NetCmd Project Context
 
-## Project
-NetCmd is a Python 3.10+ multivendor SSH command runner using Netmiko and Rich.
+Version: 1.2.1 (development release; not published on PyPI).
 
-## Current Version
-1.2.0
+Platform: Windows Python 3.10+; Netmiko 4.x; Rich.
 
-## Environment
-Windows / PowerShell; Python 3.10 or later; dependencies in `requirements.txt`.
+Supported: Standard host (-ho), host list (-hf) with common -cmd/-cf; Multifile (-mf) with HostName/DeviceType. CLI modes exec and config, CLI interaction directives @timeout, @expect, @send, @wait, @wait-disconnect, @reconnect; workers default 20.
 
-## Input Modes
-- Single: `-ho` plus `-cmd` / `-cf`
-- Standard batch: `-hf` plus `-cmd` / `-cf`
-- Multifile: `-mf` with `HostName:` and optional `DeviceType:` blocks
+V1.2.1 adds: prompt-driven interactive CLI, SSH test mode, port and SSH config, strict known_hosts options, visible SSH error classifications, connection status summary, no empty outputs.
 
-## Features
-- Configurable `-dt / --device-type`; per-host override in Multifile
-- `-w / --workers` concurrent device execution (20 by default)
-- Interactive workflow directives: `@timeout`, `@expect`, `@send`, `@wait`, `@wait-disconnect`, `@reconnect`
-- `--mode exec/config`, `--dry-run`, `--verbose`, and `--version`
-- Output filename modifiers: `--prefix`, `--suffix`, `--timestamp`
-- Result TXT: commands and raw responses only
-- Logs directory: full event log and summary log; no CSV
+Outputs: Results per device with only `prompt+command` and CLI output; Logs full and Summary; no CSV. Password prompt uses getpass; passwords are not written to logs by NetCmd.
 
-## Files
-`netcmd.py`, `README.md`, `requirements.txt`, `examples/`, `tests/`, `.gitignore`.
-
-## Constraints
-Interactive operations, upgrades and reconnects require lab validation on each platform. The parser and offline simulated SSH tests do not guarantee platform-specific behavior. Keep real secrets, device inventories and collected output out of GitHub.
-
-## Release
-Initial publication of v1.2.0 in the public GitHub repository.
+Current limitations: Never assume vendor command correctness; regex-based CLI errors may need driver-specific adjustments; Netmiko accepts OpenSSH configuration with certain patterns such as ProxyCommand, but does not guarantee every SSH config directive. Device tests were simulated offline. No live production testing performed.
