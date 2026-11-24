@@ -1,0 +1,4 @@
+# Safe read-only examples
+show version
+show inventory
+show clock
