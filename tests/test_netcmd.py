@@ -1,4 +1,4 @@
-"""Unit tests for NetCmd 1.2.1 without live network devices."""
+"""Unit tests for NetCmd 1.2.2 without live network devices."""
 from __future__ import annotations
 import contextlib
 import io
@@ -145,3 +145,44 @@ class NetCmdTests(TestCase):
 
 
 if __name__ == '__main__': main()
+
+
+class CliTrackingTests(TestCase):
+    def test_submode_transitions(self):
+        tracker = netcmd.CliModeTracker('SW01#', 'cisco_ios')
+        fixtures = [
+            ('config t', 'SW01(config)#'),
+            ('tacacs server TACACS-NEW-01', 'SW01(config-server-tacacs)#'),
+            ('address ipv4 192.0.2.10', 'SW01(config-server-tacacs)#'),
+            ('exit', 'SW01(config)#'),
+            ('end', 'SW01#'),
+            ('wr', 'SW01#'),
+        ]
+        for cmd, after in fixtures:
+            before = tracker.current_prompt
+            payload = f'{cmd}\r\n{after}'
+            self.assertEqual(tracker.observe(cmd,payload),after)
+            self.assertEqual(netcmd.session_transcript(before,cmd,payload), f'{before}{cmd}\n')
+        self.assertEqual(tracker.current_prompt, 'SW01#')
+
+    def test_reject_failed_config_transition(self):
+        tracker = netcmd.CliModeTracker('SW01#','cisco_ios')
+        with self.assertRaisesRegex(netcmd.CommandFailure,'not entered'):
+            tracker.observe('config t','SW01#config t\r\nSW01#')
+
+    def test_reject_failed_end_transition(self):
+        tracker = netcmd.CliModeTracker('SW01(config)#','cisco_ios')
+        with self.assertRaisesRegex(netcmd.CommandFailure,'not exited'):
+            tracker.observe('end','SW01(config)#')
+
+    def test_no_premature_prompt_from_middle_of_output(self):
+        self.assertIsNone(netcmd.extract_cli_prompt('SW01#\nProcessing...'))
+        self.assertEqual(netcmd.extract_cli_prompt('SW01#\nProcessing...\nSW01(config)#'), 'SW01(config)#')
+
+    def test_multivendor_prompt_tracking_does_not_force_cisco_mode(self):
+        tracker=netcmd.CliModeTracker('device>', 'juniper_junos')
+        self.assertEqual(tracker.observe('configure', 'device#'),'device#')
+
+    def test_transcript_removes_new_submode_prompt(self):
+        raw='SW01#config t\r\nEnter configuration commands\r\nSW01(config)#'
+        self.assertEqual(netcmd.session_transcript('SW01#','config t',raw), 'SW01#config t\nEnter configuration commands\n')
