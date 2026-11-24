@@ -1,97 +1,91 @@
-# NetCmd — Multivendor Network Command Runner
+# NetCmd v1.2.1
 
-**Version 1.2.0** · Python 3.10+ · SSH / Netmiko
+Multivendor SSH command runner for Windows and other Python 3.10+ systems. Netmiko and Rich. Executes commands on individual devices or in parallel (20 workers by default). Supports Cisco IOS-XE, NX-OS, Arista EOS, and other Netmiko drivers. Command syntax is device-specific.
 
-NetCmd executes CLI commands over SSH on a single network device or on multiple devices concurrently. It supports Cisco IOS/IOS-XE, NX-OS, Arista EOS, and other drivers supported by Netmiko. Interactive workflows can wait for CLI prompts, send responses, and reconnect after a planned reboot.
-
-> **Safety:** Run disruptive workflows in a lab first. NetCmd sends commands that you provide; it does not independently prove that an upgrade is safe or successful.
-
-## Installation (Windows PowerShell)
+## Installation
 
 ```powershell
 py -m pip install -r requirements.txt
-py netcmd.py --help
 py netcmd.py --version
 ```
 
-## Run commands
+For an installed PyPI distribution, `netcmd --version` uses the CLI entry point.
 
-**Single device**
-
-```powershell
-py netcmd.py -ho 192.0.2.11 -cmd examples/commands.txt -u admin -dt cisco_ios
-```
-
-**Same commands on multiple devices**
+## Modes
 
 ```powershell
-py netcmd.py -hf examples/hosts.txt -cmd examples/commands.txt -u admin -dt cisco_ios -w 20
+# Interactive wizard: host/host file, commands, username, password, suffix
+netcmd
+
+# Single host
+netcmd -ho 192.0.2.10 -cmd commands.txt -u admin -dt cisco_ios
+
+# Multiple devices, identical commands
+netcmd -hf hosts.txt -cf commands.txt -u admin -dt cisco_ios -w 20
+
+# Multifile, device-specific commands
+netcmd -mf multifile.txt -u admin -w 20
+
+# SSH-only test: no commands and no result .txt files
+netcmd -hf hosts.txt -u admin -dt cisco_ios --test-connection
+
+# Alternate SSH port
+netcmd -ho 192.0.2.10 -cmd commands.txt -u admin --port 2222
+
+# OpenSSH config file (including compatible ProxyCommand setups)
+netcmd -ho router-alias -cmd commands.txt -u admin --ssh-config ~/.ssh/config
+
+# Explicit key verification with user's default known_hosts
+netcmd -ho 192.0.2.10 -cmd commands.txt -u admin --strict-host-key
+
+# Explicit custom known_hosts (combine with --strict-host-key to reject unknown keys)
+netcmd -ho 192.0.2.10 -cmd commands.txt -u admin --known-hosts ~/.ssh/known_hosts --strict-host-key
 ```
 
-**Different commands per device (Multifile)**
+Use `-cmd`, `-cf`, or `--command-file` as synonyms. `--prefix`, `--suffix`, and `--timestamp` change **output filenames only**. `--verbose` prints device-level results as each worker finishes. Without `--verbose`, only connection failures appear per-device on screen.
 
-```powershell
-py netcmd.py -mf examples/multifile.txt -u admin -w 20
-```
-
-**Preview without connecting**
-
-```powershell
-py netcmd.py -mf examples/multifile.txt --dry-run
-```
-
-**Customize result names**
-
-```powershell
-py netcmd.py -mf examples/multifile.txt --prefix pre --suffix checks --timestamp -o Network_Audit
-```
-
-## Multifile input
+### Multifile
 
 ```text
-HostName:192.0.2.11
+HostName:SW01
 DeviceType:cisco_ios
 show version
 show inventory
 !
-
-HostName:192.0.2.12
+HostName:SW02
 DeviceType:arista_eos
 show version
 show interfaces status
 !
 ```
 
-Each device has its own command sequence. Repeated hostname blocks are combined in their original order. The `DeviceType:` directive overrides the CLI default driver. The host file and command file are used together in standard mode; `-mf` replaces both.
+### Interactive command directives
 
-## Interactive commands
-
-The same directives work in `-cmd` and `-mf`.
+The same parser works with `-cmd` and `-mf`:
 
 ```text
 @timeout 60
 copy running-config startup-config
 @expect Destination filename
 @send [Enter]
-
-@timeout 60
-copy running-config bootflash:Config_2026_11_11
-@expect Destination filename
-@send [Enter]
 ```
 
-Available workflow directives: `@timeout`, `@expect`, `@send`, `@wait`, `@wait-disconnect`, `@reconnect`. An `@expect` must match before its corresponding `@send` is transmitted. `@send y` sends `y` plus Enter; `@send [Enter]` sends only Enter.
+Directives also include `@wait`, `@wait-disconnect`, and `@reconnect`. Always validate prompts and procedures on your hardware and firmware before disruptive execution. Timeouts do not guarantee that a command has finished safely.
 
-For a planned reboot, a sequence could include:
+## Output and logs
+
+Result text files now resemble a live CLI session:
 
 ```text
-@wait-disconnect 300
-@reconnect 900
+SW01#show version
+Cisco IOS XE Software ...
+
+SW01#show module
+Module  Status
+1       ok
 ```
 
-Verify CLI prompt wording and timeout values on your actual device platform before use. A reconnect alone does not validate upgrade success.
-
-## Output
+The prompt is read from the device's live CLI session rather than reconstructed from the input hostname. The capture removes only the first duplicated echo and a trailing standalone prompt; interactive prompts and CLI error text are preserved. If no CLI command has produced a response, **no empty TXT is written**.
 
 ```text
 Outputs/
@@ -103,22 +97,27 @@ Outputs/
     └── Summary_YYYYMMDD_HHMMSS.log
 ```
 
-Result `.txt` files contain commands and original CLI responses only. Complete diagnostics and an execution summary go into separate `.log` files. No CSV or JSON reports are generated.
+No CSV or JSON reports are generated. `--test-connection` writes only logs, not result `.txt` files. At the end, the terminal shows a green `Status: All Success` when all devices succeeded; otherwise it shows red `Some Commands Failed` or `Some Devices Failed`. Authentication failure and unresolved hostnames are shown in the terminal even without verbose mode.
 
-The terminal normally shows NET COMMAND RUNNER, mode, device count, start/end time and a Rich progress bar. Use `--verbose` to show each completed device.
+## Connection options
 
-## Test
+| Option | Purpose |
+|---|---|
+| `--port` | Destination SSH port (default 22) |
+| `--conn-timeout` | TCP/SSH connect timeout |
+| `--timeout` | Per-command timeout |
+| `-dt` | Netmiko device driver, otherwise SSH autodetection |
+| `--ssh-config` | Path to OpenSSH config used by Netmiko (ProxyCommand support; compatibility depends on Netmiko) |
+| `--known-hosts` | Load a custom host key file |
+| `--strict-host-key` | Reject unknown/mismatched SSH server host keys |
+| `--test-connection` | Check SSH connectivity and authentication only; no commands |
+
+**Security:** Prefer entering the password through the secure prompt rather than `-p` on the command line. Avoid committing real configuration outputs, private hostnames or credentials to public repositories. A host-key check protects against connecting to an unexpected server; ensure you trust the key material.
+
+## Local tests
 
 ```powershell
 py -m unittest discover -s tests -v
 ```
 
-These tests are offline and do **not** establish connections to real network devices. Always validate interactive CLI behaviors against your specific firmware and model.
-
-## Security
-
-Use password prompts instead of passing credentials in the command line where practical. Never commit real hostnames, IP inventories, credentials, private configuration backups or production output logs. Example IP addresses use the documentation-only `192.0.2.0/24` range.
-
-## Repository
-
-Maintained as `jpesqueda/NetCmd`. This source tree contains release 1.2.0; see `PROJECT_CONTEXT.md` for implementation context.
+Offline tests cover command transcript formatting, error categorization, empty-output suppression, interactive prompting, and test-connection mode. Live SSH integration must still be tested against representative devices before any production change.
