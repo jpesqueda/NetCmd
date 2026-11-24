@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NetCmd v1.2.0: multivendor SSH command runner with interactive workflows.
+"""NetCmd v1.2.1: multivendor SSH command runner with interactive workflows.
 
 Designed for Windows / Python 3.10+. No third-party package is imported when
 showing --help, --version or validating an input file with --dry-run.
@@ -14,12 +14,13 @@ import getpass
 import logging
 from pathlib import Path
 import re
+import socket
 import sys
 import threading
 import time
 from typing import Any
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 DEFAULT_TIMEOUT = 60.0
 PROMPT_PATTERN = re.compile(r"(?m)^\s*[^\r\n]{1,160}[#>$]\s*$")
 ERROR_PATTERN = re.compile(
@@ -77,6 +78,8 @@ class DeviceResult:
     status: str = "FAILED"
     reason: str = ""
     output_path: str = ""
+    connection_error: str = ""
+    connection_details: str = ""
 
 
 def positive_float(value: str) -> float:
@@ -185,7 +188,7 @@ def read_input(path: str) -> list[tuple[int, str]]:
         raise InputError(f"Cannot read {p}: {exc}") from exc
 
 
-def load_multifile(path: str) -> list[DeviceJob]:
+def load_multifile(path: str, *, require_commands: bool = True) -> list[DeviceJob]:
     raw = read_input(path)
     grouped: dict[str, DeviceJob] = {}
     buffers: list[tuple[int, str]] = []
@@ -228,14 +231,14 @@ def load_multifile(path: str) -> list[DeviceJob]:
     if not grouped:
         raise InputError(f"{path}: no devices found")
     for device in grouped.values():
-        if not any(isinstance(s, CommandStep) for s in device.steps):
+        if require_commands and not any(isinstance(s, CommandStep) for s in device.steps):
             raise InputError(f"{path}: {device.host} has no commands")
     return list(grouped.values())
 
 
-def load_standard(host: str | None, host_file: str | None, commands_file: str) -> list[DeviceJob]:
-    steps = parse_steps(read_input(commands_file), commands_file)
-    if not any(isinstance(s, CommandStep) for s in steps):
+def load_standard(host: str | None, host_file: str | None, commands_file: str | None, *, require_commands: bool = True) -> list[DeviceJob]:
+    steps = parse_steps(read_input(commands_file), commands_file) if commands_file and require_commands else []
+    if require_commands and not any(isinstance(s, CommandStep) for s in steps):
         raise InputError(f"{commands_file}: no commands")
     hosts = [host] if host else [line.strip() for _, line in read_input(host_file or "") if line.strip() and not line.lstrip().startswith("#")]
     unique = list(dict.fromkeys(h.casefold() for h in hosts))
@@ -253,6 +256,9 @@ def build_parser() -> argparse.ArgumentParser:
   python netcmd.py -mf examples/multifile.txt -u admin --dry-run
   python netcmd.py -mf examples/multifile.txt -u admin --verbose --timestamp
   python netcmd.py -hf examples/hosts.txt -cmd examples/interactive.txt -dt cisco_nxos -w 2 --yes
+  python netcmd.py -hf examples/hosts.txt -u admin --test-connection -dt cisco_ios
+  python netcmd.py -ho SW01 -cmd examples/commands.txt --port 2222
+  python netcmd.py                     # interactive wizard
 
 Interactive syntax: @timeout SEC (before command), @expect REGEX, @send TEXT,
                     @send [Enter], @wait SEC, @wait-disconnect SEC,
@@ -278,6 +284,11 @@ Interactive syntax: @timeout SEC (before command), @expect REGEX, @send TEXT,
     execution.add_argument("-w", "--workers", type=positive_int, default=20, help="parallel devices (default: 20)")
     execution.add_argument("--timeout", type=positive_float, default=DEFAULT_TIMEOUT, help="per-command timeout seconds (default: 60)")
     execution.add_argument("--conn-timeout", type=positive_float, default=15, help="SSH connection timeout seconds (default: 15)")
+    execution.add_argument("--port", type=positive_int, default=22, help="SSH TCP port (default: 22)")
+    execution.add_argument("--ssh-config", help="path to OpenSSH config file (ProxyCommand supported by Netmiko)")
+    execution.add_argument("--known-hosts", help="custom SSH known_hosts file")
+    execution.add_argument("--strict-host-key", action="store_true", help="reject unknown SSH host keys; load user known_hosts")
+    execution.add_argument("--test-connection", action="store_true", help="verify SSH and authentication only; do not run commands")
     execution.add_argument("--retries", type=int, default=1, help="extra connection retries (default: 1; never retries commands)")
     execution.add_argument("--dry-run", action="store_true", help="validate and preview without SSH")
     execution.add_argument("-y", "--yes", action="store_true", help="confirm potentially disruptive commands")
@@ -306,7 +317,9 @@ def redact_command(command: str) -> str:
 
 def setup_logger(path: Path) -> logging.Logger:
     logger = logging.getLogger("netcmd")
-    logger.handlers.clear()
+    for old_handler in list(logger.handlers):
+        logger.removeHandler(old_handler)
+        old_handler.close()
     logger.setLevel(logging.INFO)
     logger.propagate = False
     handler = logging.FileHandler(path, encoding="utf-8")
@@ -317,8 +330,15 @@ def setup_logger(path: Path) -> logging.Logger:
 
 def detect_and_connect(host: str, dtype: str | None, username: str, password: str, args: Any):
     from netmiko import ConnectHandler, SSHDetect
-    base = dict(host=host, username=username, password=password, conn_timeout=args.conn_timeout,
-                auth_timeout=args.conn_timeout, banner_timeout=args.conn_timeout, fast_cli=False)
+    base = dict(host=host, username=username, password=password, port=args.port,
+                conn_timeout=args.conn_timeout, auth_timeout=args.conn_timeout,
+                banner_timeout=args.conn_timeout, fast_cli=False,
+                ssh_strict=args.strict_host_key, system_host_keys=args.strict_host_key)
+    if args.ssh_config:
+        base["ssh_config_file"] = str(Path(args.ssh_config).expanduser())
+    if args.known_hosts:
+        base["alt_host_keys"] = True
+        base["alt_key_file"] = str(Path(args.known_hosts).expanduser())
     if args.secret:
         base["secret"] = args.secret
     resolved = dtype or args.device_type
@@ -332,7 +352,7 @@ def detect_and_connect(host: str, dtype: str | None, username: str, password: st
                 resolved = guess
             connection = ConnectHandler(device_type=resolved, **base)
             try:
-                if connection.check_enable_mode() is False:
+                if not args.test_connection and connection.check_enable_mode() is False:
                     connection.enable()
             except (AttributeError, ValueError):
                 pass  # Not every platform implements enable mode.
@@ -341,11 +361,54 @@ def detect_and_connect(host: str, dtype: str | None, username: str, password: st
             last_exc = exc
             # Never retry authentication failures or unknown drivers.
             message = type(exc).__name__.lower() + " " + str(exc).lower()
-            if any(x in message for x in ("authentication", "auth_exception", "password", "unsupported device", "ssh autodetection")):
+            if any(x in message for x in ("authentication", "auth_exception", "password", "unsupported device", "ssh autodetection", "name or service not known", "getaddrinfo failed")):
                 break
             if attempt < args.retries:
                 time.sleep(min(2 ** attempt, 5))
     raise CommandFailure(f"SSH connection failed: {type(last_exc).__name__}: {last_exc}")
+
+
+def classify_connection_error(exc: BaseException) -> tuple[str, str]:
+    """Map connection errors to safe, actionable terminal labels."""
+    detail = str(exc)
+    lower = (type(exc).__name__ + " " + detail).lower()
+    if any(x in lower for x in ("authenticationexception", "netmikoauthenticationexception", "authentication failed", "auth failed", "bad authentication", "permission denied", "authentication failure")):
+        return "AUTHENTICATION FAILED", detail
+    if any(x in lower for x in ("gaierror", "getaddrinfo", "name or service not known", "nodename nor servname", "no such host", "name resolution", "host not found", "unknown host", "non-existent domain")):
+        return "HOST UNKNOWN", detail
+    if any(x in lower for x in ("badhostkey", "host key", "known_hosts", "server not found in known_hosts")):
+        return "SSH HOST KEY ERROR", detail
+    if any(x in lower for x in ("connection refused", "actively refused")):
+        return "SSH PORT REFUSED", detail
+    if any(x in lower for x in ("timeout", "timed out", "tcp connection", "network is unreachable", "no route to host", "socket")):
+        return "SSH CONNECTION FAILED", detail
+    if "ssh autodetection" in lower:
+        return "DEVICE TYPE UNKNOWN", detail
+    return "SSH CONNECTION FAILED", detail
+
+
+def session_transcript(prompt: str, command: str, response: str) -> str:
+    """One CLI-looking block: real prompt+command followed by captured output.
+
+    Strip only an exact leading echoed command and final naked prompt. Do not
+    throw away arbitrary CLI error text, or duplicate a command echo.
+    """
+    cleaned = response.replace("\r\n", "\n").replace("\r", "\n")
+    lines = cleaned.split("\n")
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    command_text = command.strip()
+    if lines:
+        first = lines[0].strip()
+        if first == command_text or (prompt and first == prompt.strip() + command_text) or (prompt and first == prompt.strip() + " " + command_text):
+            lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if lines and prompt and lines[-1].strip() == prompt.strip():
+        lines.pop()
+    remainder = "\n".join(lines).strip("\n")
+    title = f"{prompt.strip() if prompt else ''}{command_text}"
+    return title + "\n" + (remainder + "\n" if remainder else "")
 
 
 def channel_read_until(connection: Any, pattern: str, timeout: float, *, quiet_prompt: bool = False) -> str:
@@ -438,8 +501,17 @@ def device_worker(job: DeviceJob, args: Any, logger: logging.Logger, outpath: Pa
     output_chunks: list[str] = []
     connection = None
     try:
-        connection, dtype = detect_and_connect(job.host, job.device_type, username, password, args)
-        logger.info("%s | Connected | device_type=%s", job.host, dtype)
+        try:
+            connection, dtype = detect_and_connect(job.host, job.device_type, username, password, args)
+        except Exception as exc:
+            result.connection_error, result.connection_details = classify_connection_error(exc)
+            raise
+        logger.info("%s | Connected | device_type=%s | port=%d", job.host, dtype, args.port)
+        if args.test_connection:
+            result.status = "PASS"
+            result.reason = "SSH authentication successful"
+            logger.info("%s | TEST CONNECTION | PASS", job.host)
+            return result
         if args.mode == "config":
             connection.config_mode()
         for step in job.steps:
@@ -451,12 +523,9 @@ def device_worker(job: DeviceJob, args: Any, logger: logging.Logger, outpath: Pa
             logger.info("%s | Executing line=%d | %s", job.host, step.line, redact_command(step.command))
             start = time.perf_counter()
             try:
+                prompt = connection.find_prompt().strip()
                 response, connection = run_command(connection, step, timeout, job.host, dtype, username, password, args)
-                # A command transcript contains the command echo and the raw CLI response.
-                # Avoid duplicate echo; add it if the remote terminal did not echo it.
-                if not re.search(re.escape(step.command), response, re.I):
-                    response = f"{job.host}# {step.command}\n" + response
-                output_chunks.append(response.rstrip("\n") + "\n\n")
+                output_chunks.append(session_transcript(prompt, step.command, response).rstrip("\n") + "\n\n")
                 reason = classify_command(step.command, response)
                 if reason:
                     raise CommandFailure(reason)
@@ -486,14 +555,15 @@ def device_worker(job: DeviceJob, args: Any, logger: logging.Logger, outpath: Pa
                 connection.disconnect()
             except Exception:
                 pass
-        # Keep raw results, even if a command failed. No banner or status text.
-        # Collision protection is checked before workers start.
-        try:
-            outpath.write_text("".join(output_chunks), encoding="utf-8")
-        except OSError as exc:
-            result.status = "FAILED"
-            result.reason = f"Cannot write output: {exc}"
-            logger.error("%s | OUTPUT FAILED | %s", job.host, exc)
+        # Never generate a blank .txt on authentication/SSH failure or test mode.
+        # Keep all actual CLI evidence, including CLI error responses.
+        if output_chunks and not args.test_connection:
+            try:
+                outpath.write_text("".join(output_chunks), encoding="utf-8")
+            except OSError as exc:
+                result.status = "FAILED"
+                result.reason = f"Cannot write output: {exc}"
+                logger.error("%s | OUTPUT FAILED | %s", job.host, exc)
         logger.info("%s | RESULT | %s | pass=%d failed=%d skipped=%d | %s", job.host, result.status,
                     result.passed, result.failed, result.skipped, result.reason)
     return result
@@ -506,17 +576,69 @@ def duration_string(seconds: float) -> str:
     return (f"{h} hours " if h else "") + (f"{m} minutes " if m else "") + f"{s} seconds"
 
 
+def interactive_options() -> tuple[list[str], str]:
+    """Prompt for the basic workflow; keep password out of shell history."""
+    print("NET COMMAND RUNNER\n\nInteractive Mode\n")
+    while True:
+        source = input("Host / host file / multifile: ").strip().strip('"')
+        if source:
+            break
+    if source.lower().startswith("mf:"):
+        selected = ["-mf", source[3:].strip()]
+    elif Path(source).is_file() or source.lower().endswith((".txt", ".csv")):
+        # A host-file path is selected by default; use mf:PATH for Multifile.
+        selected = ["-hf", source]
+    else:
+        selected = ["-ho", source]
+    cmd = "" if selected[0] == "-mf" else input("Command file: ").strip().strip('"')
+    while selected[0] != "-mf" and not cmd:
+        cmd = input("Command file (required): ").strip().strip('"')
+    if cmd:
+        selected.extend(["-cmd", cmd])
+    username = input("User: ").strip()
+    while not username:
+        username = input("User (required): ").strip()
+    password = getpass.getpass("Password: ")
+    suffix = input("Suffix (optional): ").strip()
+    selected.extend(["-u", username])
+    if suffix:
+        selected.extend(["--suffix", suffix])
+    return selected, password
+
+
+def overall_status(results: list[DeviceResult]) -> tuple[str, str]:
+    if all(r.status == "PASS" for r in results):
+        return "All Success", "green"
+    if any(r.failed or (r.status == "PARTIAL" and not r.connection_error) for r in results):
+        return "Some Commands Failed", "red"
+    return "Some Devices Failed", "red"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    supplied = sys.argv[1:] if argv is None else argv
+    wizard_password = None
+    wizard_mode = not supplied
+    if wizard_mode:
+        if not sys.stdin.isatty():
+            parser.error("interactive mode requires a terminal")
+        supplied, wizard_password = interactive_options()
+    args = parser.parse_args(supplied)
+    if wizard_password is not None:
+        args.password = wizard_password
     if args.multifile and args.command_file:
         parser.error("-mf/--multifile cannot be combined with -cf/-cmd")
-    if not args.multifile and not args.command_file:
-        parser.error("-ho/-hf requires -cf/-cmd")
+    if not args.multifile and not args.command_file and not args.test_connection:
+        parser.error("-ho/-hf requires -cf/-cmd unless --test-connection is used")
+    if not (1 <= args.port <= 65535):
+        parser.error("--port must be within 1..65535")
+    for path_opt in (args.ssh_config, args.known_hosts):
+        if path_opt and not Path(path_opt).expanduser().is_file():
+            parser.error(f"SSH configuration file not found: {path_opt}")
     if args.retries < 0:
         parser.error("--retries must be >= 0")
     try:
-        jobs = load_multifile(args.multifile) if args.multifile else load_standard(args.host, args.host_file, args.command_file)
+        jobs = load_multifile(args.multifile, require_commands=not args.test_connection) if args.multifile else load_standard(args.host, args.host_file, args.command_file, require_commands=not args.test_connection)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         names = [result_filename(j.host, args, stamp) for j in jobs]
         if len({n.lower() for n in names}) != len(names):
@@ -525,7 +647,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(str(exc))
     mode = "MULTIFILE" if args.multifile else "STANDARD"
     commands_count = sum(isinstance(s, CommandStep) for j in jobs for s in j.steps)
-    print("NET COMMAND RUNNER\n")
+    if not wizard_mode:
+        print("NET COMMAND RUNNER\n")
     print(f"Mode       : {mode}\nDevices    : {len(jobs)}\nWorkers    : {args.workers}")
     disruptive = any(isinstance(step, CommandStep) and DISRUPTIVE.search(step.command)
                      for job in jobs for step in job.steps)
@@ -565,10 +688,11 @@ def main(argv: list[str] | None = None) -> int:
     root = Path(args.output)
     result_dir, log_dir = root / "Results", root / "Logs"
     try:
-        existing = [result_dir / n for n in names if (result_dir / n).exists()]
+        existing = [] if args.test_connection else [result_dir / n for n in names if (result_dir / n).exists()]
         if existing and not args.overwrite:
             raise InputError(f"Output already exists: {existing[0]}; use --overwrite, --timestamp or another -o")
-        result_dir.mkdir(parents=True, exist_ok=True)
+        if not args.test_connection:
+            result_dir.mkdir(parents=True, exist_ok=True)
         log_dir.mkdir(parents=True, exist_ok=True)
     except (InputError, OSError) as exc:
         parser.error(str(exc))
@@ -601,7 +725,11 @@ def main(argv: list[str] | None = None) -> int:
                                           status="FAILED", reason=f"Unhandled worker failure: {exc}")
                     logger.exception("%s | Unhandled worker error", job.host)
                 results.append(result)
-                if args.verbose:
+                if result.connection_error:
+                    progress.console.print(f"[red]{result.host} | {result.connection_error}[/red]")
+                elif args.test_connection:
+                    progress.console.print(f"[green]{result.host} | SSH SUCCESS[/green]")
+                elif args.verbose:
                     progress.console.print(f"{result.host:<24} {result.status:<8} {result.passed}/{result.total}"
                                            + (f" | {result.reason[:120]}" if result.reason else ""))
                 progress.advance(task)
@@ -621,15 +749,22 @@ def main(argv: list[str] | None = None) -> int:
         file.write("\nFAILED / PARTIAL DEVICES\n")
         for r in ordered:
             if r.status != "PASS":
-                file.write(f"{r.host} | {r.status} | {r.reason}\n")
+                file.write(f"{r.host} | {r.connection_error or r.status} | {r.reason}\n")
         file.write("\nCOUNTS\n")
         for status in ("PASS", "PARTIAL", "FAILED"):
             file.write(f"{status}: {sum(r.status == status for r in ordered)}\n")
     logger.info("Finished | devices=%d pass=%d partial=%d failed=%d elapsed=%.2fs",
                 len(jobs), *(sum(r.status == s for r in ordered) for s in ("PASS", "PARTIAL", "FAILED")), elapsed)
     print(f"\nCompleted  : {len(jobs)} devices\nDone in    : {duration_string(elapsed)}")
-    print(f"End Time   : {ended_wall:%Y-%m-%d %H:%M:%S}\n")
-    print(f"Results    : {result_dir}/\nLogs       : {log_dir}/")
+    print(f"End Time   : {ended_wall:%Y-%m-%d %H:%M:%S}")
+    final_label, final_color = overall_status(ordered)
+    console.print(f"Status     : [{final_color}]{final_label}[/{final_color}]\n")
+    if not args.test_connection:
+        print(f"Results    : {result_dir}/")
+    print(f"Logs       : {log_dir}/")
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        handler.close()
     return 1 if any(r.status != "PASS" for r in ordered) else 0
 
 
