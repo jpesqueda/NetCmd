@@ -1,4 +1,4 @@
-# NetCmd v1.2.1
+# NetCmd v1.2.2
 
 Multivendor SSH command runner for Windows and other Python 3.10+ systems. Netmiko and Rich. Executes commands on individual devices or in parallel (20 workers by default). Supports Cisco IOS-XE, NX-OS, Arista EOS, and other Netmiko drivers. Command syntax is device-specific.
 
@@ -121,3 +121,43 @@ py -m unittest discover -s tests -v
 ```
 
 Offline tests cover command transcript formatting, error categorization, empty-output suppression, interactive prompting, and test-connection mode. Live SSH integration must still be tested against representative devices before any production change.
+
+
+## V1.2.2 — Automatic CLI Mode Tracking
+
+A command file can represent a full Cisco-style session, including
+config t, TACACS configuration submodes, exit, end, and wr. NetCmd
+waits for the final complete prompt after each command; for Cisco/Arista
+drivers it detects failed config t/end transitions. No extra CLI flags.
+
+Example tacacs_config.txt (documentation-only addresses/keys):
+
+```text
+config t
+tacacs server TACACS-NEW-01
+address ipv4 192.0.2.10
+key 0 REEMPLAZAR_CLAVE
+exit
+tacacs server TACACS-NEW-02
+address ipv4 192.0.2.11
+key 0 REEMPLAZAR_CLAVE
+exit
+aaa group server tacacs+ TACACS_NEW
+server name TACACS-NEW-01
+server name TACACS-NEW-02
+exit
+end
+wr
+```
+
+Run: `netcmd -hf hosts.txt -cmd tacacs_config.txt -u admin --suffix TACACS`
+
+The default is mode exec, so the file itself should contain config t
+when needed; do not also pass --mode config for this mixed file.
+
+SAFETY: CLI result captures may expose secrets from commands.
+Do not commit real TACACS keys or captured configuration outputs.
+For AAA changes use a pilot switch, independent login verification,
+out-of-band recovery and --on-error stop before changing a fleet.
+Prompt recognition is best-effort on Cisco-like devices; device/firmware
+behavior must be validated. This is not transactional rollback.
