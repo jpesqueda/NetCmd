@@ -1,0 +1,11 @@
+HostName:192.0.2.11
+DeviceType:cisco_ios
+show version
+show inventory
+!
+
+HostName:192.0.2.12
+DeviceType:arista_eos
+show version
+show interfaces status
+!
